@@ -1,0 +1,41 @@
+﻿/* Shared reusable styles across Svelte components */
+
+.panel {
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 0.75rem 0.75rem 1rem;
+  background: #f8fafc;
+}
+
+.panel-title {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.row.two-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+.field { margin-bottom: 0.75rem; float: left; }
+.field label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+  color: #111827;
+  background: transparent;
+  text-align: left;
+}
+
+.hint { font-size: 0.85rem; color: #374151; }
+
+/* Form inputs (generic) */
+label, .panel-title, .hint { color: #111827; }
+select, input[type="number"], input[type="text"], input[type="range"] {
+  background: #ffffff;
+  color: #111827;
+  display: block;
+}
