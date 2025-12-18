@@ -41,13 +41,25 @@
     videoUrl = null
   }
 
-  onDestroy(() => {
+  onDestroy(async () => {
     cleanupUrl()
-    try { frameProvider?.close() } catch {}
+    try { await frameProvider?.close() } catch {}
     frameProvider = null
   })
 
-  function handleFiles(files: FileList | null) {
+  let lastFile: File | null = null;
+  let providerLoading = false;
+  let providerBusy = false;
+
+  $: {
+    // Poll for provider busy state if needed, though Svelte 5 might handle it differently.
+    // In Svelte 5, if frameProvider is a state, its properties are reactive.
+    // However, frameProvider is not necessarily a Svelte state here.
+    // But since we update angles which triggers updateAnglePreviewInternal, 
+    // we can sync it there.
+  }
+
+  async function handleFiles(files: FileList | null) {
     error = null
     if (!files || files.length === 0) return
     const f = files[0]
@@ -59,60 +71,47 @@
       return
     }
     file = f
+    lastFile = f
     cleanupUrl()
     videoUrl = URL.createObjectURL(f)
+    projection = 'Dual Fisheye (Insta360)'
     angles = [] // reset angles when new video is loaded
-    if (isInsv) {
-      // Set a sensible default projection for Insta360 dual-fisheye
-      projection = 'Dual Fisheye (Insta360)'
-    }
 
-    // Read file as ArrayBuffer and send to worker
-    const reader = new FileReader()
-    reader.onload = async () => {
-      try {
-        const buf = reader.result as ArrayBuffer
-        try { frameProvider?.close() } catch {
-          console.warn('Failed to close frame provider.');
+    await reloadProvider();
+  }
+
+  async function reloadProvider() {
+    if (!lastFile) return;
+    providerLoading = true;
+    try {
+      if (frameProvider) {
+        try { await frameProvider.close() } catch (e) {
+          console.warn('Failed to close frame provider.', e);
         }
-        frameProvider = await createProvider(buf, f.name, projection)
-      } catch (e: any) {
-        error = 'INSV load error: ' + (e?.message || String(e))
-        insvInfo = null
+        frameProvider = null;
       }
+      frameProvider = await createProvider(lastFile, lastFile.name, projection)
+    } catch (e: any) {
+      error = 'Provider load error: ' + (e?.message || String(e))
+    } finally {
+      providerLoading = false;
     }
-    reader.onerror = () => {
-      error = 'Failed to read INSV file.'
-      insvInfo = null
-    }
-    reader.readAsArrayBuffer(f)
+  }
+
+  // Reload provider when projection changes (important for INSV dual-track)
+  $: if (projection && lastFile) {
+    reloadProvider();
   }
 
   function touchAngles() { angles = [...angles] }
 
-  function captureCurrentFrame(): string | null {
-    if (!videoEl || isNaN(videoEl.videoWidth) || videoEl.videoWidth === 0) return null
-    const maxW = 320
-    const scale = Math.min(1, maxW / videoEl.videoWidth)
-    const w = Math.round(videoEl.videoWidth * scale)
-    const h = Math.round(videoEl.videoHeight * scale)
-    const canvas = document.createElement('canvas')
-    canvas.width = w
-    canvas.height = h
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return null
-    ctx.drawImage(videoEl, 0, 0, w, h)
-    return canvas.toDataURL('image/png')
-  }
-
-  function addCameraAngle() {
-    const fallbackPreview = captureCurrentFrame()
-    if (!fallbackPreview) return
+  async function addCameraAngle() {
+    const time = videoEl?.currentTime ?? 0
     const newAngle: VirtualCamera = {
       id: nextId++,
       label: `Angle ${nextId - 1}`,
-      previewDataUrl: fallbackPreview,
-      time: videoEl?.currentTime ?? 0,
+      previewDataUrl: '', // Will be updated immediately
+      time,
       angle: {
         pitch: 0,
         yaw: 0,
@@ -120,10 +119,51 @@
       }
     }
     angles = [...angles, newAngle]
+    // The reactive block will pick this up and update the preview
   }
+
 
   let lastPreviewTick = 0
   const PREVIEW_THROTTLE_MS = 200
+
+  // Update all previews when time or relevant settings change
+  $: if (videoEl && !exporting) {
+    // Watch relevant settings to update previews
+    projection;
+    aspectPreset;
+    customAspectW;
+    customAspectH;
+    
+    // We also want to update when angles are added/removed or changed
+    for (const angle of angles) {
+      angle.angle.pitch;
+      angle.angle.yaw;
+      angle.angle.roll;
+    }
+
+    const now = Date.now()
+    if (now - lastPreviewTick >= PREVIEW_THROTTLE_MS) {
+      // Use untrack if using Svelte 5, but here we are in a reactive block
+      // that we want to trigger on these dependencies.
+      // However, we only want to trigger the loop once per tick.
+      // updateAnglePreview itself is throttled.
+      for (const angle of angles) {
+        updateAnglePreview(angle)
+      }
+    }
+  }
+
+  function handleTimeUpdate() {
+    // timeupdate will trigger the reactive block above because videoEl.currentTime changes
+    // Wait, the reactive block doesn't explicitly watch videoEl.currentTime.
+    // Let's add it there or keep handleTimeUpdate but ensure it respects the same throttle.
+    const now = Date.now()
+    if (now - lastPreviewTick < PREVIEW_THROTTLE_MS) return
+    // We don't set lastPreviewTick here, let updateAnglePreview do it to keep it unified
+    for (const angle of angles) {
+      updateAnglePreview(angle)
+    }
+  }
 
   function aspectRatioValue(): number {
     if (aspectPreset !== 'Custom') {
@@ -143,129 +183,7 @@
     return { w, h }
   }
 
-  function drawToAspect(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement) {
-    // Draw the current video frame to fill canvas (cover), cropping excess
-    const vidW = videoEl.videoWidth
-    const vidH = videoEl.videoHeight
-    const canW = canvas.width
-    const canH = canvas.height
-    const scale = Math.max(canW / vidW, canH / vidH)
-    const drawW = Math.round(vidW * scale)
-    const drawH = Math.round(vidH * scale)
-    const dx = Math.round((canW - drawW) / 2)
-    const dy = Math.round((canH - drawH) / 2)
-    ctx.drawImage(videoEl, dx, dy, drawW, drawH)
-  }
 
-  // ---- Preview orientation mapping helpers (equirect -> rectilinear) ----
-  function toRad(deg: number) { return (deg * Math.PI) / 180 }
-
-  function ensureImageData(src: ImageBitmap | ImageData): ImageData {
-    if (src instanceof ImageBitmap) {
-      const c = document.createElement('canvas')
-      c.width = src.width
-      c.height = src.height
-      const cctx = c.getContext('2d')!
-      cctx.drawImage(src, 0, 0)
-      return cctx.getImageData(0, 0, c.width, c.height)
-    }
-    return src
-  }
-
-  function bilinearSample(img: ImageData, u: number, v: number, out: Uint8ClampedArray, o: number) {
-    // u,v in [0,1], u wraps, v clamps
-    const w = img.width
-    const h = img.height
-    // wrap u
-    u = u - Math.floor(u)
-    // clamp v
-    v = Math.max(0, Math.min(1, v))
-    const x = u * (w - 1)
-    const y = v * (h - 1)
-    const x0 = Math.floor(x)
-    const y0 = Math.floor(y)
-    const x1 = Math.min(x0 + 1, w - 1)
-    const y1 = Math.min(y0 + 1, h - 1)
-    const dx = x - x0
-    const dy = y - y0
-    const d = img.data
-    const idx = (xx: number, yy: number) => (yy * w + xx) * 4
-    const i00 = idx(x0, y0)
-    const i10 = idx(x1, y0)
-    const i01 = idx(x0, y1)
-    const i11 = idx(x1, y1)
-    for (let c = 0; c < 4; c++) {
-      const p00 = d[i00 + c]
-      const p10 = d[i10 + c]
-      const p01 = d[i01 + c]
-      const p11 = d[i11 + c]
-      const p0 = p00 + (p10 - p00) * dx
-      const p1 = p01 + (p11 - p01) * dx
-      out[o + c] = Math.round(p0 + (p1 - p0) * dy)
-    }
-  }
-
-  function rotateVec(vx: number, vy: number, vz: number, yawDeg: number, pitchDeg: number, rollDeg: number) {
-    const yaw = toRad(yawDeg)
-    const pitch = toRad(pitchDeg)
-    const roll = toRad(rollDeg)
-    // Ry(yaw)
-    let x = vx * Math.cos(yaw) + vz * Math.sin(yaw)
-    let y = vy
-    let z = -vx * Math.sin(yaw) + vz * Math.cos(yaw)
-    // Rx(pitch)
-    let x2 = x
-    let y2 = y * Math.cos(pitch) - z * Math.sin(pitch)
-    let z2 = y * Math.sin(pitch) + z * Math.cos(pitch)
-    // Rz(roll)
-    const xr = x2 * Math.cos(roll) - y2 * Math.sin(roll)
-    const yr = x2 * Math.sin(roll) + y2 * Math.cos(roll)
-    const zr = z2
-    return { x: xr, y: yr, z: zr }
-  }
-
-  function renderRectilinearPreview(src: ImageBitmap | ImageData, outW: number, outH: number, angle: { pitch: number; yaw: number; roll: number }, fovDeg = 90): HTMLCanvasElement {
-    const srcData = ensureImageData(src)
-    const outCanvas = document.createElement('canvas')
-    outCanvas.width = outW
-    outCanvas.height = outH
-    const outCtx = outCanvas.getContext('2d')!
-    const outImg = outCtx.createImageData(outW, outH)
-    const dst = outImg.data
-
-    // pinhole camera model
-    const fov = toRad(Math.max(1, Math.min(175, fovDeg)))
-    const fx = 0.5 * outW / Math.tan(fov / 2)
-    const fy = fx // square pixels
-
-    // Map each pixel
-    let o = 0
-    for (let j = 0; j < outH; j++) {
-      const ny = (j + 0.5) - outH / 2
-      for (let i = 0; i < outW; i++, o += 4) {
-        const nx = (i + 0.5) - outW / 2
-        // camera ray in camera space
-        const rx = nx / fx
-        const ry = -ny / fy // screen y down -> world y up
-        const rz = 1
-        // normalize
-        const invLen = 1 / Math.hypot(rx, ry, rz)
-        const rnx = rx * invLen
-        const rny = ry * invLen
-        const rnz = rz * invLen
-        // rotate by yaw/pitch/roll
-        const v = rotateVec(rnx, rny, rnz, angle.yaw, angle.pitch, angle.roll)
-        // spherical
-        const lon = Math.atan2(v.x, v.z) // [-pi, pi]
-        const lat = Math.asin(Math.max(-1, Math.min(1, v.y))) // [-pi/2, pi/2]
-        const u = (lon + Math.PI) / (2 * Math.PI)
-        const vcoord = (Math.PI / 2 - lat) / Math.PI
-        bilinearSample(srcData, u, vcoord, dst, o)
-      }
-    }
-    outCtx.putImageData(outImg, 0, 0)
-    return outCanvas
-  }
 
   async function extractFrames() {
     if (!frameProvider || !videoEl) {
@@ -285,6 +203,7 @@
     exporting = true
     exportProgress = 0
     cancelExport = false
+    providerBusy = true
 
     const step = 1 / Math.max(1, samplesPerSecond)
     const times: number[] = []
@@ -307,40 +226,44 @@
         for (const cam of angles) {
           if (cancelExport) break
           try {
-            const stereo = await frameProvider.frameAt(ts, cam.angle)
-            // Draw selected eye (use left by default) to fill output canvas (cover)
+            const processed = await frameProvider.frameAt(ts, cam.angle, outW, outH)
+            const img = new Image()
+            img.src = processed.dataUrl
+            await new Promise((res) => img.onload = res)
             outCtx.clearRect(0, 0, outW, outH)
-
-            const src = stereo.left
-            const sW = src instanceof ImageBitmap ? src.width : src.width
-            const sH = src instanceof ImageBitmap ? src.height : src.height
-
-            // Compute cover fit
-            const scale = Math.max(outW / sW, outH / sH)
-            const dW = Math.round(sW * scale)
-            const dH = Math.round(sH * scale)
-            const dx = Math.round((outW - dW) / 2)
-            const dy = Math.round((outH - dH) / 2)
-
-            if (src instanceof ImageBitmap) {
-              outCtx.drawImage(src, dx, dy, dW, dH)
-            } else {
-              // ImageData path: draw to a temp canvas first
-              const tmp = document.createElement('canvas')
-              tmp.width = src.width
-              tmp.height = src.height
-              const tctx = tmp.getContext('2d')!
-              tctx.putImageData(src, 0, 0)
-              outCtx.drawImage(tmp, dx, dy, dW, dH)
-            }
+            outCtx.drawImage(img, 0, 0)
 
             const blob: Blob = await new Promise((res) => outCanvas.toBlob((b) => res(b!), 'image/jpeg', 0.92))
             const tsStr = ts.toFixed(2).replace(/\./g, '_')
             const safeLabel = cam.label.replace(/[^a-z0-9-_]+/gi, '_') || `Angle_${cam.id}`
             const fname = `${safeLabel}_${tsStr}.jpg`
             zip.file(fname, blob)
-          } catch (e) {
-            console.warn('Export frame failed at', ts, cam, e)
+            
+            // Cleanup dataUrl to free memory
+            URL.revokeObjectURL(processed.dataUrl)
+          } catch (e: any) {
+            if (e?.message === 'FFmpeg is busy') {
+              // During export, we shouldn't be busy, but if we are, wait a bit and retry once
+              await new Promise(r => setTimeout(r, 100));
+              try {
+                const processed = await frameProvider.frameAt(ts, cam.angle, outW, outH)
+                const img = new Image()
+                img.src = processed.dataUrl
+                await new Promise((res) => img.onload = res)
+                outCtx.clearRect(0, 0, outW, outH)
+                outCtx.drawImage(img, 0, 0)
+                const blob: Blob = await new Promise((res) => outCanvas.toBlob((b) => res(b!), 'image/jpeg', 0.92))
+                const tsStr = ts.toFixed(2).replace(/\./g, '_')
+                const safeLabel = cam.label.replace(/[^a-z0-9-_]+/gi, '_') || `Angle_${cam.id}`
+                const fname = `${safeLabel}_${tsStr}.jpg`
+                zip.file(fname, blob)
+                URL.revokeObjectURL(processed.dataUrl)
+              } catch (e2) {
+                console.warn('Export frame failed at', ts, cam, e2)
+              }
+            } else {
+              console.warn('Export frame failed at', ts, cam, e)
+            }
           } finally {
             done++
             exportProgress = done / total
@@ -360,59 +283,40 @@
       }
     } finally {
       exporting = false
+      providerBusy = frameProvider?.busy ?? false
     }
   }
 
   async function updateAnglePreview(angle: VirtualCamera) {
+    if (exporting) return
+
     const now = Date.now()
     if (now - lastPreviewTick < PREVIEW_THROTTLE_MS) return
     lastPreviewTick = now
+    await updateAnglePreviewInternal(angle)
+  }
 
+
+  async function updateAnglePreviewInternal(angle: VirtualCamera) {
     if (!frameProvider || !videoEl) return
-
     const ts = videoEl.currentTime || 0
+
+    providerBusy = frameProvider.busy;
     try {
-      const stereo = await frameProvider.frameAt(ts, angle.angle)
-      // Render a small preview respecting the selected aspect and orientation
       const maxW = 240
       const ratio = aspectRatioValue()
       const w = maxW
       const h = Math.max(1, Math.round(w / ratio))
-      const src = stereo.left // choose left eye for preview
 
-      let canvas: HTMLCanvasElement
-      if (projection === 'Equirectangular (mono)' || projection === 'Stereoscopic SBS' || projection === 'Stereoscopic OU') {
-        canvas = renderRectilinearPreview(src, w, h, angle.angle, 90)
-      } else {
-        // Dual fisheye not mapped yet — fallback to cover-fit
-        const c = document.createElement('canvas')
-        c.width = w
-        c.height = h
-        const ctx = c.getContext('2d')!
-        const sW = src instanceof ImageBitmap ? src.width : src.width
-        const sH = src instanceof ImageBitmap ? src.height : src.height
-        const scale = Math.max(w / sW, h / sH)
-        const dW = Math.round(sW * scale)
-        const dH = Math.round(sH * scale)
-        const dx = Math.round((w - dW) / 2)
-        const dy = Math.round((h - dH) / 2)
-        if (src instanceof ImageBitmap) {
-          ctx.drawImage(src, dx, dy, dW, dH)
-        } else {
-          const tmp = document.createElement('canvas')
-          tmp.width = src.width
-          tmp.height = src.height
-          const tctx = tmp.getContext('2d')!
-          tctx.putImageData(src, 0, 0)
-          ctx.drawImage(tmp, dx, dy, dW, dH)
-        }
-        canvas = c
-      }
-
-      angle.previewDataUrl = canvas.toDataURL('image/jpeg', 0.85)
+      const processed = await frameProvider.frameAt(ts, angle.angle, w, h)
+      angle.previewDataUrl = processed.dataUrl
       touchAngles()
-    } catch (e) {
-      console.warn('Preview update failed', e)
+    } catch (e: any) {
+      if (e?.message !== 'FFmpeg is busy') {
+        console.warn('Preview update failed', e)
+      }
+    } finally {
+      providerBusy = frameProvider?.busy ?? false;
     }
   }
 
@@ -423,6 +327,9 @@
     <DropZone {error} on:files={(e) => handleFiles(e.detail)} />
   {:else}
     <section class="workspace">
+      {#if providerLoading}
+        <div class="loading-overlay">Initializing video tracks...</div>
+      {/if}
       <div class="top">
         <aside class="sidebar">
           <SettingsPanel
@@ -441,14 +348,16 @@
           />
         </aside>
         <div class="main">
-          <PlayerPanel {videoUrl} bind:videoEl />
+          <PlayerPanel {videoUrl} bind:videoEl on:timeupdate={handleTimeUpdate} />
         </div>
       </div>
 
       <section class="bottom">
         <div class="angles-and-actions">
           <div class="angles-toolbar">
-            <button class="primary" on:click={addCameraAngle}>Add camera angle from current frame</button>
+            <button class="primary" on:click={addCameraAngle} disabled={providerLoading || providerBusy || exporting}>
+              Add camera angle from current frame
+            </button>
           </div>
           <AnglesPanel {angles} onTouch={touchAngles} onUpdatePreview={updateAnglePreview} />
         </div>
@@ -489,4 +398,16 @@
   .export-actions .warn { background: #ef4444; color: #fff; border: none; padding: 0.5rem 0.9rem; border-radius: 8px; cursor: pointer; }
   .progress { height: 6px; background: #e5e7eb; border-radius: 999px; overflow: hidden; }
   .progress .bar { height: 100%; background: #3b82f6; width: 0; transition: width 0.2s; }
+
+  .loading-overlay {
+    position: fixed;
+    top: 1rem;
+    right: 1rem;
+    background: #2563eb;
+    color: white;
+    padding: 0.5rem 1rem;
+    border-radius: 8px;
+    z-index: 1000;
+    box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+  }
 </style>

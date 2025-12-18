@@ -6,7 +6,7 @@
 
 <div class="player-panel">
   <!-- svelte-ignore a11y-media-has-caption -->
-  <video bind:this={videoEl} src={videoUrl || ''} controls playsinline></video>
+  <video bind:this={videoEl} src={videoUrl || ''} controls playsinline on:timeupdate></video>
 </div>
 
 <style>
